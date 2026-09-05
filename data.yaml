@@ -1,0 +1,5 @@
+train: images/train
+val: images/val
+
+nc: 4
+names: ['traffic_light_red', 'traffic_light_green', 'crosswalk', 'temi']
