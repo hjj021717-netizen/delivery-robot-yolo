@@ -1,5 +1,6 @@
 from collections import deque, Counter
 import time
+import math
 import cv2
 import numpy as np
 import logging
@@ -10,102 +11,124 @@ logging.basicConfig(
     format='%(asctime)s - %(message)s'
 )
 
+REAL_OBJECT_HEIGHTS_M = {
+    'traffic_light_red': 0.30,
+    'traffic_light_green': 0.30,
+    'crosswalk': 0.50,
+    'temi': 1.00,
+    'pedestrian': 0.88,
+}
 
-class TrafficLightColorDetector:
-    """
-    YOLO가 찾은 신호등 박스 안에서 빨간색 여부만 판단.
-    빨간색 감지 정확도가 높다는 실측 결과를 반영해,
-    빨간색이 아니면 무조건 초록불로 간주.
-    """
-    def __init__(self, red_threshold=0.15, min_bright_pixels=5):
-        self.red_threshold = red_threshold
-        self.min_bright_pixels = min_bright_pixels
-
-    def detect_color(self, image, box_xyxy, top_percent=0.15):
-        x1, y1, x2, y2 = map(int, box_xyxy)
-        light_region = image[y1:y2, x1:x2]
-
-        gray = cv2.cvtColor(light_region, cv2.COLOR_BGR2GRAY)
-        if gray.size == 0:
-            return "UNKNOWN", 0
-
-        threshold = np.percentile(gray, 100 - top_percent * 100)
-        bright_mask = gray >= threshold
-        bright_pixels = light_region[bright_mask]
-
-        if len(bright_pixels) < self.min_bright_pixels:
-            return "UNKNOWN", 0
-
-        b = bright_pixels[:, 0].astype(float)
-        g = bright_pixels[:, 1].astype(float)
-        r = bright_pixels[:, 2].astype(float)
-        total = r + g + b + 1e-6
-        red_score = np.mean((r - np.maximum(g, b)) / total)
-
-        if red_score >= self.red_threshold:
-            return "RED", red_score
-        else:
-            return "GREEN", 1 - red_score
+CAMERA_FOV_VERTICAL_DEG = 55
+IMAGE_HEIGHT_PIXELS = 640
 
 
-class TrafficLightController:
-    """
-    신호등 색깔만 보고 로봇을 멈추거나 보내는 단순한 로직.
-    - 빨간불 또는 미감지/불안정: 정지 (/cmd_vel 0)
-    - 초록불: 진행 (Nav2가 이미 그은 웨이포인트대로 이동, 별도 명령 불필요)
-    - 거리/장애물(temi, 보행자) 판단 없음 - Nav2가 웨이포인트대로 이동하며 처리.
-    """
-    def __init__(self, history_size=5, min_confidence=0.5):
+def estimate_distance_from_box_size(box_height_pixels, class_name):
+    if box_height_pixels <= 0:
+        return 999
+    real_height = REAL_OBJECT_HEIGHTS_M.get(class_name, 0.5)
+    ratio = box_height_pixels / IMAGE_HEIGHT_PIXELS
+    fov_rad = math.radians(CAMERA_FOV_VERTICAL_DEG)
+    distance = real_height / (2 * ratio * math.tan(fov_rad / 2))
+    return round(distance, 2)
+
+
+def yolo_results_to_detections(yolo_result, class_names):
+    detections = []
+    for box in yolo_result.boxes:
+        class_id = int(box.cls[0])
+        class_name = class_names[class_id]
+        confidence = float(box.conf[0])
+        box_height = float(box.xywh[0][3])
+        estimated_distance = estimate_distance_from_box_size(box_height, class_name)
+        detections.append({
+            'class': class_name,
+            'conf': confidence,
+            'distance': estimated_distance
+        })
+    return detections
+
+
+class RobotBehaviorController:
+    def __init__(self, history_size=5, min_confidence=0.5, api_client=None):
         self.state = "MOVING"
+        self.green_light_entry_time = None
         self.history_size = history_size
         self.min_confidence = min_confidence
         self.detection_history = deque(maxlen=history_size)
+        self.api_client = api_client
 
     def filter_low_confidence(self, detections):
         return [d for d in detections if d['conf'] >= self.min_confidence]
 
-    def get_stable_light_color(self, current_detections):
+    def get_stable_state(self, current_detections):
         filtered = self.filter_low_confidence(current_detections)
-        traffic_lights = [d for d in filtered if 'traffic_light' in d['class']]
-
-        if traffic_lights:
-            best = max(traffic_lights, key=lambda x: x['conf'])
-            self.detection_history.append(best['class'])
-        else:
-            self.detection_history.append(None)
-
-        votes = [v for v in self.detection_history if v is not None]
-        if not votes:
+        self.detection_history.append(filtered)
+        light_votes = []
+        for frame_detections in self.detection_history:
+            traffic_lights = [d for d in frame_detections if 'traffic_light' in d['class']]
+            if traffic_lights:
+                best = max(traffic_lights, key=lambda x: x['conf'])
+                light_votes.append(best['class'])
+        if not light_votes:
             return None
-
-        most_common, count = Counter(votes).most_common(1)[0]
-        if count >= (self.history_size // 2 + 1):
-            return most_common
+        most_common = Counter(light_votes).most_common(1)[0]
+        vote_class, vote_count = most_common
+        if vote_count >= (self.history_size // 2 + 1):
+            return vote_class
         return "UNSTABLE"
 
     def decide_action(self, raw_detections):
-        stable_light = self.get_stable_light_color(raw_detections)
+        filtered = self.filter_low_confidence(raw_detections)
+        for det in filtered:
+            if det['class'] == 'pedestrian' and det.get('distance', 999) < 0.2:
+                return self._stop("보행자 20cm 이내 - 충돌 판정")
+            if det['class'] == 'temi' and det.get('distance', 999) < 0.5:
+                return self._stop("temi 근접")
+        stable_light = self.get_stable_state(raw_detections)
+        if stable_light is None:
+            return self._continue("신호등 미감지 - 현재 상태 유지, 주의 진행")
+        if stable_light == "UNSTABLE":
+            return self._stop("신호등 색깔 불안정 - 안전을 위해 일시 정지")
+        if stable_light == "traffic_light_red":
+            return self._handle_red_light()
+        if stable_light == "traffic_light_green":
+            return self._handle_green_light()
+        return self._continue("안전, 진행")
 
-        if stable_light is None or stable_light == "UNSTABLE":
-            return self._stop("신호등 미감지 또는 불안정 - 안전 정지")
+    def _handle_red_light(self):
+        if self.state == "CROSSING":
+            elapsed = time.time() - self.green_light_entry_time
+            if elapsed > 3.0:
+                return self._stop(f"빨간불 전환 후 {elapsed:.1f}초 경과 - 패널티 위험")
+            return self._continue("빨간불이지만 3초 이내 - 횡단 계속 허용")
+        return self._wait_at_light("빨간불 - 횡단보도 진입 대기")
 
-        if 'red' in str(stable_light):
-            return self._stop("빨간불 감지")
-
-        if 'green' in str(stable_light):
-            return self._go("초록불 감지")
-
-        return self._stop("알 수 없는 상태 - 안전 정지")
+    def _handle_green_light(self):
+        if self.state == "WAITING_AT_LIGHT":
+            self.green_light_entry_time = time.time()
+            return self._go("초록불 - 횡단 시작")
+        return self._continue("초록불 확인, 진행 유지")
 
     def _stop(self, reason):
         self._log_and_print("STOP", reason)
         self.state = "STOPPED"
         return "STOP"
 
+    def _wait_at_light(self, reason):
+        self._log_and_print("WAIT", reason)
+        self.state = "WAITING_AT_LIGHT"
+        return "STOP"
+
     def _go(self, reason):
         self._log_and_print("GO", reason)
-        self.state = "MOVING"
+        self.state = "CROSSING"
         return "GO"
+
+    def _continue(self, reason=""):
+        if reason:
+            self._log_and_print("CONTINUE", reason)
+        return "CONTINUE"
 
     def _log_and_print(self, action, reason):
         message = f"[{action}] {reason}"
@@ -113,44 +136,7 @@ class TrafficLightController:
         logging.info(message)
 
 
-def yolo_results_to_detections(yolo_result, class_names, image, color_detector=None):
-    """
-    YOLO 예측 결과를 컨트롤러가 이해하는 형태로 변환.
-    신호등이면 color_detector로 실제 색깔(빨간색 우선)을 재검증.
-    """
-    detections = []
-    for box in yolo_result.boxes:
-        class_id = int(box.cls[0])
-        class_name = class_names[class_id]
-        confidence = float(box.conf[0])
-
-        if 'traffic_light' in class_name and color_detector is not None:
-            box_xyxy = box.xyxy[0].cpu().numpy()
-            verified_color, color_conf = color_detector.detect_color(image, box_xyxy)
-            if verified_color == "RED":
-                class_name = "traffic_light_red"
-            elif verified_color == "GREEN":
-                class_name = "traffic_light_green"
-            else:
-                continue
-
-        detections.append({
-            'class': class_name,
-            'conf': confidence,
-        })
-    return detections
-
-
-import cv2
-import numpy as np
-from collections import deque, Counter
-import time
-
 class TrafficLightColorDetector:
-    """
-    YOLO가 찾은 신호등 박스 안에서, 정규화된 색상 점수(밝기 영향 최소화)로
-    빨강/초록을 판단하고, 여러 프레임 다수결 + 타임아웃으로 안정화.
-    """
     def __init__(self, history_size=5, min_confidence=0.15, timeout_sec=0.3):
         self.history = deque(maxlen=history_size)
         self.min_confidence = min_confidence
